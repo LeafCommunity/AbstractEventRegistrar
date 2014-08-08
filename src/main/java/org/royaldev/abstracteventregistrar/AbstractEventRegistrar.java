@@ -1,5 +1,6 @@
 package org.royaldev.abstracteventregistrar;
 
+import org.bukkit.event.Cancellable;
 import org.bukkit.event.Event;
 import org.bukkit.event.EventException;
 import org.bukkit.event.EventPriority;
@@ -10,6 +11,10 @@ import org.bukkit.plugin.PluginManager;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.ArrayList;
@@ -34,51 +39,17 @@ public class AbstractEventRegistrar {
         this.plugin = plugin;
     }
 
-    /**
-     * Registers an abstract listener for the plugin this class was initialized with.
-     *
-     * @param eventClass Abstract class to register listener with
-     * @param l          Listener to register
-     * @param ep         EventPriority to register listener at
-     */
-    public void registerAbstractListener(final Class<? extends Event> eventClass, Listener l, EventPriority ep) {
-        this.registerAbstractListener(eventClass, l, ep, this.plugin);
-    }
-
-    /**
-     * Registers an abstract listener for the given plugin.
-     *
-     * @param eventClass Abstract class to register listener with
-     * @param l          Listener to register
-     * @param ep         EventPriority to register listener at
-     * @param p          Plugin to register under
-     */
-    public void registerAbstractListener(final Class<? extends Event> eventClass, Listener l, EventPriority ep, Plugin p) {
-        final PluginManager pm = this.plugin.getServer().getPluginManager();
-        final List<Class<? extends Event>> events = this.getSubTypesOf(Event.class, this.getClassesForPackage(Package.getPackage("org.bukkit.event")));
-        for (final Class<? extends Event> event : events) {
-            if (!eventClass.isAssignableFrom(event)) continue;
-            try {
-                event.getDeclaredMethod("getHandlerList");
-            } catch (ReflectiveOperationException ex) {
-                continue;
-            }
-            pm.registerEvent(event, l, ep, new EventExecutor() {
-                public void execute(Listener listener, Event event) throws EventException {
-                    for (Method m : listener.getClass().getDeclaredMethods()) {
-                        final Class<?>[] params = m.getParameterTypes();
-                        if (params.length != 1) continue;
-                        final Class<?> currentEvent = params[0];
-                        if (event.getClass().isAssignableFrom(currentEvent)) continue;
-                        try {
-                            m.invoke(listener, event);
-                        } catch (ReflectiveOperationException ex) {
-                            ex.printStackTrace();
-                        }
-                    }
-                }
-            }, p);
-        }
+    private ArrayList<Class<?>> getClassesForPackage(Package pkg) {
+        final ArrayList<Class<?>> classes = new ArrayList<>();
+        final String pkgname = pkg.getName();
+        final String relPath = pkgname.replace('.', '/');
+        // Get a File object for the package
+        final URL resource = ClassLoader.getSystemClassLoader().getResource(relPath);
+        if (resource == null) throw new RuntimeException("Unexpected problem: No resource for " + relPath);
+        resource.getPath();
+        if (resource.toString().startsWith("jar:")) this.processJarfile(resource, pkgname, classes);
+        else this.processDirectory(new File(resource.getPath()), pkgname, classes);
+        return classes;
     }
 
     private <T> List<Class<? extends T>> getSubTypesOf(Class<T> clazz, List<Class<?>> classes) {
@@ -132,17 +103,65 @@ public class AbstractEventRegistrar {
         }
     }
 
-    private ArrayList<Class<?>> getClassesForPackage(Package pkg) {
-        final ArrayList<Class<?>> classes = new ArrayList<>();
-        final String pkgname = pkg.getName();
-        final String relPath = pkgname.replace('.', '/');
-        // Get a File object for the package
-        final URL resource = ClassLoader.getSystemClassLoader().getResource(relPath);
-        if (resource == null) throw new RuntimeException("Unexpected problem: No resource for " + relPath);
-        resource.getPath();
-        if (resource.toString().startsWith("jar:")) this.processJarfile(resource, pkgname, classes);
-        else this.processDirectory(new File(resource.getPath()), pkgname, classes);
-        return classes;
+    /**
+     * Registers an abstract listener for the plugin this class was initialized with.
+     *
+     * @param l Listener to register
+     */
+    public void registerAbstractListener(final Listener l) {
+        this.registerAbstractListener(l, this.plugin);
+    }
+
+    /**
+     * Registers an abstract listener for the given plugin.
+     *
+     * @param l Listener to register
+     * @param p Plugin to register under
+     */
+    public void registerAbstractListener(final Listener l, final Plugin p) {
+        final PluginManager pm = p.getServer().getPluginManager();
+        final List<Class<? extends Event>> events = this.getSubTypesOf(Event.class, this.getClassesForPackage(Package.getPackage("org.bukkit.event")));
+        for (final Class<? extends Event> eventInClasspath : events) {
+            for (final Method m : l.getClass().getDeclaredMethods()) {
+                final AbstractEventHandler aeh = m.getAnnotation(AbstractEventHandler.class);
+                if (aeh == null) continue;
+                final Class<?>[] params = m.getParameterTypes();
+                if (params.length != 1) continue;
+                final Class<?> methodEvent = params[0];
+                // make sure the event in this method is an instance of the current event
+                if (!methodEvent.isAssignableFrom(eventInClasspath)) continue;
+                try {
+                    // ensure the current event can have handlers
+                    eventInClasspath.getDeclaredMethod("getHandlerList");
+                } catch (ReflectiveOperationException ex) {
+                    continue;
+                }
+                // make sure the current event is an instance of the method event
+                if (eventInClasspath.getClass().isAssignableFrom(methodEvent)) continue;
+                pm.registerEvent(eventInClasspath, l, aeh.priority(), new EventExecutor() {
+                    @Override
+                    public void execute(final Listener listener, final Event event) throws EventException {
+                        if (aeh.ignoreCancelled() && event instanceof Cancellable && ((Cancellable) event).isCancelled()) {
+                            return;
+                        }
+                        try {
+                            m.invoke(l, event);
+                        } catch (final ReflectiveOperationException ex) {
+                            ex.printStackTrace();
+                        }
+                    }
+                }, p);
+            }
+        }
+    }
+
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    public @interface AbstractEventHandler {
+
+        boolean ignoreCancelled() default false;
+
+        EventPriority priority() default EventPriority.NORMAL;
     }
 
 }
